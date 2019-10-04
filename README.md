@@ -5,10 +5,10 @@
 -->
 
 <!--
-    Copyright (c) 2019, Joyent, Inc.
+    Copyright 2019 Joyent, Inc.
 -->
 
-# manta-muskie: The Manta WebAPI
+# manta-buckets-api: The Manta Web API
 
 This repository is part of the Joyent Manta project.  For contribution
 guidelines, issues, and general documentation, visit the main
