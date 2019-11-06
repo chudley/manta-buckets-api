@@ -32,6 +32,7 @@ var vasync = require('vasync');
 
 var app = require('./lib');
 var boray = require('./lib/buckets/boray');
+var metadata_placement = require('./lib/metadata_placement');
 var uploadsCommon = require('./lib/uploads/common');
 
 ///--- Internal Functions
@@ -304,40 +305,26 @@ function createMorayClient(opts, onConnect) {
     });
 }
 
-
-function onBorayConnect(clients, barrier, borayClient) {
-    clients.boray = borayClient;
-    barrier.done('createBorayClient');
+function onMetadataPlacementClientConnect(clients, barrier, client) {
+    clients.metadataPlacement = client;
+    barrier.done('createMetadataPlacementClient');
 }
 
-
-function createBorayClient(opts, onConnect) {
+function createMetadataPlacementClient(opts, onConnect) {
     assert.object(opts, 'options');
+    assert.object(opts.electric_boray, 'options.electric_boray');
+    assert.object(opts.boray, 'options.boray');
     assert.object(opts.log, 'options.log');
 
-    var log = opts.log.child({component: 'boray'}, true);
-    opts.log = log;
+    var log = opts.log.child({component: 'metadataPlacementClient'}, true);
 
-    var client = new boray.createClient(opts);
-
-    client.once('error', function (err) {
-        client.removeAllListeners('connect');
-
-        log.error(err, 'boray: failed to connect');
-    });
+    var client = metadata_placement.createClient(opts);
 
     client.once('connect', function _onConnect() {
-        client.removeAllListeners('error');
-
-        log.info({
-            host: opts.host,
-            port: opts.port
-        }, 'boray: connected');
-
+        log.info('metadataPlacementClient connected %s', client.toString());
         onConnect(client);
     });
 }
-
 
 function onMedusaConnect(clients, medusaClient) {
     clients.medusa = medusaClient;
@@ -358,9 +345,6 @@ function createMedusaConnector(opts, onConnect) {
         onConnect(client);
     });
 }
-
-
-
 
 function clientsConnected(appName, cfg, clients) {
     var server1, server2;
@@ -389,7 +373,6 @@ function clientsConnected(appName, cfg, clients) {
 
     app.startKangServer();
 }
-
 
 ///--- Mainline
 
@@ -433,14 +416,14 @@ function clientsConnected(appName, cfg, clients) {
     clients.agent = new cueball.HttpAgent(cfg.cueballHttpAgent);
     clients.mahi = createAuthCacheClient(cfg.auth, clients.agent);
 
-    barrier.start('createMorayClient');
-    createMorayClient(cfg.moray, onMorayConnect.bind(null, clients, barrier));
-
-    if (cfg.enableBuckets && cfg.boray) {
-        barrier.start('createBorayClient');
-        createBorayClient(cfg.boray,
-            onBorayConnect.bind(null, clients, barrier));
-    }
+    var metadataPlacementOpts = {
+        electric_boray: cfg.electric_boray,
+        boray: cfg.boray,
+        log: cfg.log
+    };
+    barrier.start('createMetadataPlacementClient');
+    createMetadataPlacementClient(metadataPlacementOpts,
+        onMetadataPlacementClientConnect.bind(null, clients, barrier));
 
     // Establish other client connections needed for writes and jobs requests.
     createPickerClient(cfg.storage, cfg.log,

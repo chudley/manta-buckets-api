@@ -241,9 +241,14 @@
 
   {{! Buckets configuration options }}
   "enableBuckets": {{#BUCKETS_ENABLE}}{{{BUCKETS_ENABLE}}}{{/BUCKETS_ENABLE}}{{^BUCKETS_ENABLE}}false{{/BUCKETS_ENABLE}},
+  "electric_boray": {
+     "srvDomain": "{{ELECTRIC_BORAY}}",
+      "cueballOptions": {
+          "resolvers": ["nameservice.{{DOMAIN_NAME}}"]
+      }
+  },
   "boray": {
     "borayOptions": {
-        "srvDomain": "{{ELECTRIC_BORAY}}",
         "cueballOptions": {
             "resolvers": ["nameservice.{{DOMAIN_NAME}}"]
         }
