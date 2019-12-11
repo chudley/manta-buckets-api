@@ -13,9 +13,6 @@
 <service_bundle type="manifest" name="buckets-api">
     <service name="manta/application/buckets-api" type="service" version="1">
 
-    <create_default_instance enabled="false" />
-    <single_instance />
-
     <dependency name="network"
             grouping="require_all"
             restart_on="error"
