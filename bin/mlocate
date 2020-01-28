@@ -7,22 +7,28 @@
  */
 
 /*
- * Copyright 2019 Joyent, Inc.
+ * Copyright 2020 Joyent, Inc.
  */
 
 var fs = require('fs');
 var path = require('path');
 
 var assert = require('assert-plus');
+var bignum = require('bignum');
 var bunyan = require('bunyan');
+var clone = require('clone');
+var crypto = require('crypto');
 var dashdash = require('dashdash');
-var libmanta = require('libmanta');
-var uuidv4 = require('uuid/v4');
+var fast = require('fast');
+var mdapi = require('buckets-mdapi');
 var mahi = require('mahi');
 var manta = require('manta');
 var once = require('once');
 var restify = require('restify');
+var url = require('url');
+var uuidv4 = require('uuid/v4');
 var vasync = require('vasync');
+var verror = require('vasync');
 
 var app = require('../lib');
 var common = require('../lib/common');
@@ -71,19 +77,22 @@ function createAuthCacheClient(opts, cb) {
 
     opts.log = LOG.child({component: 'authCache'}, true);
     var client = mahi.createClient(opts);
+    // TODO figure out if all this settimeout nonsense is necessary
     setTimeout(cb, 0, null, client);
 }
 
 
-function createMorayClient(opts, cb) {
+function createMdapiClient(opts, isMdPlacement, cb) {
     assert.object(opts, 'options');
+    assert.bool(isMdPlacement, 'isMdPlacement');
     assert.func(cb, 'callback');
 
-    var log = LOG.child({component: 'moray'}, true);
+    var component_str = isMdPlacement ? 'buckets-mdplacement' : 'buckets-mdapi';
+    var log = LOG.child({component: component_str}, true);
     opts.log = log;
     opts.readOnly = true;
 
-    var client = new libmanta.createMorayClient(opts);
+    var client = new mdapi.createClient(opts);
 
     client.once('error', function (err) {
         cb(err);
@@ -118,8 +127,9 @@ function configure() {
         process.exit(1);
     }
 
-    if (opts.help)
+    if (opts.help) {
         usage();
+    }
 
     cfg = JSON.parse(fs.readFileSync(opts.file || DEFAULT_CFG, 'utf8'));
 
@@ -143,83 +153,292 @@ function configure() {
     return (cfg);
 }
 
+function parse_path(path) {
 
+}
 
 ///--- Mainline
+
+// function moops() {
+//     var cfg = configure();
+
+//     assert.object(cfg, 'no configuration');
+//     assert.object(cfg.auth, 'no auth in configuration');
+//     assert.object(cfg.moray, 'no moray in configuration');
+
+//     var mahic;
+//     var moray;
+
+//     var barrier = vasync.barrier();
+//     function ready() {
+//         if (!mahic || !moray)
+//             return;
+
+//         function resolve(p) {
+//             var login = decodeURIComponent(p.split('/', 2).pop());
+//             mahic.getUuid({ 'account': login }, function (err, result) {
+//                 if (err) {
+//                     console.error('mahi: unable to resolve %s: %s',
+//                                   login, err.toString());
+//                     process.exit(1);
+//                 } else if (!result || !result.account) {
+//                     console.error('%s is not a known account', login);
+//                     process.exit(1);
+//                 }
+
+//                 LOG.debug(result, 'loaded %s', login);
+
+//                 var key = p.replace(common.PATH_LOGIN_RE,
+//                                     '/' + result.account + '/');
+
+//                 var opts = {
+//                     key: key,
+//                     requestId: uuidv4()
+//                 };
+//                 moray.getMetadata(opts, function (err2, md, rawMd) {
+//                     if (err2) {
+//                         console.error('error loading %s: %s', p, err2);
+//                         process.exit(1);
+//                     }
+
+//                     md._key = opts.path;
+//                     md._moray = moray.url;
+//                     md._node = rawMd._node;
+//                     console.log(JSON.stringify(md));
+//                     barrier.done(p);
+//                 });
+//             });
+//         }
+
+//         cfg.paths.forEach(function (p) {
+//             barrier.start(p);
+//             setImmediate(function () {
+//                 resolve(p);
+//             });
+//         });
+
+//         barrier.once('drain', function () {
+//             process.exit(0);
+//         });
+//     }
+
+//     createAuthCacheClient(cfg.auth, function (err, client) {
+//         assert.ifError(err, 'auth cache failure');
+//         mahic = client;
+//         ready();
+//     });
+
+//     createBorayClient(cfg.moray, function (err, client) {
+//         assert.ifError(err, 'moray failure');
+//         moray = client;
+//         ready();
+//     });
+
+// }
+
+// TODO better error messages throughout program?
+
+/*
+ * Args:
+ * opts:
+ *     - mdplacementc: mdplacement client
+ *     - mahic: mahi client
+ *     - placementData: mdplacement data
+ * path: path to look up
+ */
+function locateObject(opts, path) {
+    vasync.pipeline({
+        arg: {}, // ctx
+        funcs: [
+            function getUuid(ctx, next) {
+                var login = decodeURIComponent(path.split('/', 2).pop());
+                opts.mahic.getUuid({ 'account': login }, function (err, result) {
+                    if (err) {
+                        next(err);
+                        return;
+                    } else if (!result || !result.account) {
+                        next(new verror.VError('%s is not a known account', login));
+                        return;
+                    }
+                    LOG.debug(result, 'loaded %s', login);
+                    ctx.account_uuid = result.account;
+                    next();
+                });
+            },
+            function getPnodeVnode(ctx, next) {
+                var tkey = ctx.account_uuid + ':' + 'bucket1' + ':' + 'test.txt';
+                var value = crypto.createHash(opts.placementData.ring.algorithm.NAME).
+                    update(tkey).digest('hex');
+                var vnodeHashInterval =
+                    opts.placementData.ring.algorithm.VNODE_HASH_INTERVAL;
+                var vnode = parseInt(bignum(value, 16).div(bignum(vnodeHashInterval, 16)),
+                    10);
+                var pnode = opts.placementData.ring.vnodeToPnodeMap[vnode].pnode;
+                ctx.pnode = pnode;
+                ctx.vnode = vnode;
+                next();
+            },
+            function createMdClient(ctx, next) {
+                var pnodeUrl = url.parse(ctx.pnode);
+                assert.string(pnodeUrl.port, 'pnodeUrl.port');
+                assert.string(pnodeUrl.hostname, 'pnodeUrl.hostname');
+
+                LOG.info({
+                    url: pnodeUrl
+                }, 'creating buckets-mdapi client');
+
+                var buckets_mdapi_args = clone(opts.buckets_mdapi_cfg);
+                if (!buckets_mdapi_args.cueballOptions) {
+                    buckets_mdapi_args.cueballOptions = {};
+                }
+                buckets_mdapi_args.unwrapErrors = true;
+                buckets_mdapi_args.srvDomain = pnodeUrl.hostname;
+                buckets_mdapi_args.cueballOptions.defaultPort =
+                    parseInt(pnodeUrl.port, 10);
+                buckets_mdapi_args.crc_mode = fast.FAST_CHECKSUM_V2;
+                createMdapiClient(buckets_mdapi_args, false,
+                    function(err, client) {
+                    if (err) {
+                        next(err);
+                        return;
+                    }
+                    ctx.mdapiClient = client;
+                    next();
+                });
+            },
+            function getBucket(ctx, next) {
+                ctx.mdapiClient.getBucket(
+                    ctx.account_uuid,
+                    'bucket1',
+                    ctx.vnode,
+                    uuidv4(),
+                    function onGet(err, data) {
+                        if (err) {
+                            next(err);
+                            return;
+                        }
+                        console.log(data);
+                        next();
+                    }
+                )
+            }
+
+            // Get bucket info from mdapi client
+            // If there's also an object part of the path: get that too
+        ]
+    }, function pipelineDone(err, results) {
+        assert.ifError(err);
+    });
+}
 
 (function main() {
     var cfg = configure();
 
     assert.object(cfg, 'no configuration');
     assert.object(cfg.auth, 'no auth in configuration');
-    assert.object(cfg.moray, 'no moray in configuration');
+    assert.object(cfg.buckets_mdplacement, 'no mdplacement in configuration');
+    assert.object(cfg.buckets_mdapi, 'no mdapi in configuration');
 
-    var mahic;
-    var moray;
-
-    var barrier = vasync.barrier();
-    function ready() {
-        if (!mahic || !moray)
-            return;
-
-        function resolve(p) {
-            var login = decodeURIComponent(p.split('/', 2).pop());
-            mahic.getUuid({ 'account': login }, function (err, result) {
-                if (err) {
-                    console.error('mahi: unable to resolve %s: %s',
-                                  login, err.toString());
-                    process.exit(1);
-                } else if (!result || !result.account) {
-                    console.error('%s is not a known account', login);
-                    process.exit(1);
-                }
-
-                LOG.debug(result, 'loaded %s', login);
-
-                var key = p.replace(common.PATH_LOGIN_RE,
-                                    '/' + result.account + '/');
-
-                var opts = {
-                    key: key,
-                    requestId: uuidv4()
-                };
-                moray.getMetadata(opts, function (err2, md, rawMd) {
-                    if (err2) {
-                        console.error('error loading %s: %s', p, err2);
-                        process.exit(1);
+    vasync.pipeline({
+        arg: {}, // ctx
+        funcs: [
+            function getClients(ctx, next) {
+                vasync.parallel({
+                    funcs: [
+                        function getAuthCache(done) {
+                            createAuthCacheClient(cfg.auth, function (err, client) {
+                                if (err) {
+                                    done(err);
+                                }
+                                ctx.mahic = client;
+                                done();
+                            });
+                        },
+                        function getMoray(done) {
+                            createMdapiClient(
+                                cfg.buckets_mdplacement,
+                                true,
+                                function (err, client) {
+                                if (err) {
+                                    done(err);
+                                }
+                                ctx.mdplacementc = client;
+                                done();
+                            });
+                        }
+                    ]
+                }, next);
+            },
+            function getPlacementData(ctx, next) {
+                ctx.mdplacementc.getPlacementData(function(err, data) {
+                    if (err) {
+                        next(err);
+                        return;
                     }
-
-                    md._key = opts.path;
-                    md._moray = moray.url;
-                    md._node = rawMd._node;
-                    console.log(JSON.stringify(md));
-                    barrier.done(p);
+                    ctx.placementData = data;
+                    next();
                 });
-            });
-        }
+            },
+            function locateObjects(ctx, next) {
+                ctx.buckets_mdapi_cfg = cfg.buckets_mdapi;
+                var barrier = vasync.barrier();
+                // function resolve(p) {
+                //     var mdplacementc = ctx.mdplacementc;
+                //     var mahic = ctx.mahic;
+                //     var placementData = ctx.placementData;
 
-        cfg.paths.forEach(function (p) {
-            barrier.start(p);
-            setImmediate(function () {
-                resolve(p);
-            });
-        });
+                //     var login = decodeURIComponent(p.split('/', 2).pop());
 
-        barrier.once('drain', function () {
-            process.exit(0);
-        });
-    }
+                //     mahic.getUuid({ 'account': login }, function (err, result) {
+                //         if (err) {
+                //             console.error('mahi: unable to resolve %s: %s',
+                //                           login, err.toString());
+                //             process.exit(1);
+                //         } else if (!result || !result.account) {
+                //             console.error('%s is not a known account', login);
+                //             process.exit(1);
+                //         }
 
-    createAuthCacheClient(cfg.auth, function (err, client) {
-        assert.ifError(err, 'auth cache failure');
-        mahic = client;
-        ready();
+                //         LOG.debug(result, 'loaded %s', login);
+
+                //         var key = p.replace(common.PATH_LOGIN_RE,
+                //                             '/' + result.account + '/');
+
+                //         var opts = {
+                //             key: key,
+                //             requestId: uuidv4()
+                //         };
+                //         // mdplacementc.getMetadata(opts, function (err2, md, rawMd) {
+                //         //     if (err2) {
+                //         //         console.error('error loading %s: %s', p, err2);
+                //         //         process.exit(1);
+                //         //     }
+
+                //         //     md._key = opts.path;
+                //         //     md._moray = mdplacementc.url;
+                //         //     md._node = rawMd._node;
+                //         //     console.log(JSON.stringify(md));
+                //         //     barrier.done(p);
+                //         // });
+                //     });
+                // }
+
+                cfg.paths.forEach(function (p) {
+                    barrier.start(p);
+                    setImmediate(function () {
+                        locateObject(ctx, p);
+                    });
+                });
+
+                barrier.once('drain', function () {
+                    process.exit(0);
+                });
+            }
+        ]
+    }, function pipelineDone(err, results) {
+        assert.ifError(err);
     });
 
-    createMorayClient(cfg.moray, function (err, client) {
-        assert.ifError(err, 'moray failure');
-        moray = client;
-        ready();
-    });
+
 
 })();
